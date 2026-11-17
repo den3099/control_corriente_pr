@@ -66,11 +66,28 @@ Para lograr un seguimiento preciso de la corriente sinusoidal de 50 Hz, se utili
 ### Módulo Árbitro
 ### Módulo PWM
 
-El periférico PWM se diseñó para generar las cuatro señales de accionamiento del puente H (`pwm_AH`, `pwm_AL`, `pwm_BH` y `pwm_BL`) a partir de una referencia de modulación suministrada por el sistema de control. Su configuración se realiza mediante una interfaz AXI4-Lite, que permite modificar los parámetros de operación y consultar el estado del periférico.
+### Módulo PWM
 
-El diseño contempla dos parámetros principales: la habilitación del generador (`enable`) y la selección de frecuencia de conmutación (`freq_sel`). Además, recibe una referencia de modulación de 16 bits con signo (`duty_ref`), que determina los niveles de comparación para las dos ramas del inversor.
+El periférico PWM, implementado en `PWM_CONTROLLER`, genera las cuatro señales de accionamiento del puente H, `pwm_AH`, `pwm_AL`, `pwm_BH` y `pwm_BL`. Recibe del MicroBlaze V una referencia de modulación mediante AXI4-Lite, junto con los parámetros de habilitación y frecuencia. Su funcionamiento depende del reloj `clk`, del reinicio `rst` y de la configuración escrita por el programa de control.
 
-A partir de estos parámetros, el sistema genera una portadora triangular y realiza una modulación unipolar mediante su comparación con las referencias calculadas. Las señales resultantes pasan por una etapa de generación de tiempo muerto de 50 ciclos de reloj, obteniendo las cuatro señales complementarias destinadas al accionamiento del puente H. Cuando el periférico se encuentra deshabilitado, las salidas permanecen en estado bajo.
+Internamente, integra cinco submódulos.
+
+- **`AXI_LITE_INTERFACE`** recibe las solicitudes de lectura y escritura del procesador y permite acceder al banco de registros.
+- **`PWM_REGISTERS`** almacena la habilitación, la selección de frecuencia y la referencia. También permite consultar `running`, que indica una configuración habilitada con frecuencia válida.
+- **`PWM_FREQUENCY_GENERATOR`** genera una portadora triangular mediante un contador ascendente y descendente. Con un reloj de 100 MHz, permite seleccionar frecuencias de 5, 10 y 20 kHz.
+- **`UNIPOLAR_MODULATOR`** utiliza `duty_ref`, una referencia de 16 bits con signo en formato Q1.15, para calcular los umbrales de ambas ramas. Al compararlos con la portadora obtiene `raw_pwm_A` y `raw_pwm_B`.
+- **`DEAD_TIME_GENERATOR`** procesa estas señales e inserta un intervalo con ambas salidas de cada rama en bajo antes de activar la salida correspondiente. El tiempo muerto se fija en 50 ciclos, equivalentes a 500 ns a 100 MHz.
+
+La configuración se organiza en dos registros, cuyos offsets se suman a la dirección base del periférico.
+
+| Offset | Registro | Campos |
+| --- | --- | --- |
+| `0x00` | Control y estado | `enable` en el bit 0, `freq_sel` en los bits [2:1] y `running` de solo lectura en el bit 3. |
+| `0x04` | Referencia | `duty_ref` en los bits [15:0]. |
+
+Una vez habilitado, el PWM continúa funcionando con la referencia almacenada mientras el procesador realiza otras tareas. Sus salidas se entregan a la interfaz de accionamiento del puente H. Cuando se deshabilita o se activa `rst`, las cuatro salidas permanecen en bajo.
+
+En la versión recibida quedan pendientes la incorporación de `pwm_trigger_o`, la saturación de escrituras y la validación de los cambios de frecuencia durante la operación.
 
 ### Módulo 
 ### Módulo 
