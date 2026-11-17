@@ -45,12 +45,8 @@ El periférico GPIO permite conectar los botones y los indicadores LED con el pr
 
 ### Módulo UART
 
-El periférico AXI UART Lite permite transmitir a la computadora las muestras almacenadas por el sistema. Recibe los bytes que escribe el procesador mediante AXI4-Lite, los guarda temporalmente en un búfer y los transmite de forma serial por la salida tx, con la velocidad configurada. La entrada rx permite recibir información desde el equipo externo cuando se utiliza esta función. El módulo también dispone de registros de estado para que el programa consulte la disponibilidad de los búferes. La salida de transmisión se conecta al puente USB-UART utilizado para la comunicación con la computadora.
+El periférico UART Lite permite transmitir a la computadora las muestras almacenadas por el sistema. Recibe los bytes que escribe el procesador mediante AXI4-Lite, los guarda temporalmente en un búfer y los transmite de forma serial por la salida tx, con la velocidad configurada. La entrada rx permite recibir información desde el equipo externo cuando se utiliza esta función. El módulo también dispone de registros de estado para que el programa consulte la disponibilidad de los búferes. La salida de transmisión se conecta al puente USB-UART utilizado para la comunicación con la computadora.
 
 ### Módulo de interfaz ADC XADC
 
-La interfaz ADC/XADC permite obtener una representación digital de la corriente medida. Recibe una señal analógica acondicionada y una orden de inicio de conversión, que puede provenir del software o del disparo pwm_trigger_o generado por el PWM. Este disparo permite coordinar el instante de adquisición con la conmutación. Al finalizar la conversión, el módulo indica que existe una muestra disponible y presenta el dato para su lectura por el procesador mediante la interfaz AXI4-Lite. Su funcionamiento requiere las señales de reloj y reinicio correspondientes.
-
-### Módulo temporizador
-
-El periférico AXI Timer establece el intervalo periódico de ejecución del control. Recibe el reloj del sistema y los valores de configuración escritos por el procesador mediante AXI4-Lite. Internamente utiliza un contador que, al completar el intervalo programado, genera una interrupción y puede reiniciar automáticamente el conteo. El MicroBlaze V atiende esta interrupción para leer la muestra de corriente, ejecutar el regulador PR y actualizar el PWM. Así, el temporizador proporciona la base de tiempo del lazo de control.
+La interfaz ADC/XADC permite obtener una representación digital de la corriente medida. Recibe una señal analógica acondicionada y una orden de inicio de conversión, que puede provenir del software o del disparo pwm_trigger_o generado por el PWM. Este disparo permite coordinar el instante de adquisición con la conmutación. Al finalizar la conversión, el módulo indica que existe una muestra disponible y presenta el dato para su lectura por el procesador mediante la interfaz AXI4-Lite. 
