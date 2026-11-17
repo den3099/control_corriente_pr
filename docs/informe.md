@@ -64,7 +64,14 @@ Para lograr un seguimiento preciso de la corriente sinusoidal de 50 Hz, se utili
 ## Presentación de resultados
 ### Módulo Procesador
 ### Módulo Árbitro
-### Módulo 
+### Módulo PWM
+
+El periférico PWM se diseñó para generar las cuatro señales de accionamiento del puente H (`pwm_AH`, `pwm_AL`, `pwm_BH` y `pwm_BL`) a partir de una referencia de modulación suministrada por el sistema de control. Su configuración se realiza mediante una interfaz AXI4-Lite, que permite modificar los parámetros de operación y consultar el estado del periférico.
+
+El diseño contempla dos parámetros principales: la habilitación del generador (`enable`) y la selección de frecuencia de conmutación (`freq_sel`). Además, recibe una referencia de modulación de 16 bits con signo (`duty_ref`), que determina los niveles de comparación para las dos ramas del inversor.
+
+A partir de estos parámetros, el sistema genera una portadora triangular y realiza una modulación unipolar mediante su comparación con las referencias calculadas. Las señales resultantes pasan por una etapa de generación de tiempo muerto de 50 ciclos de reloj, obteniendo las cuatro señales complementarias destinadas al accionamiento del puente H. Cuando el periférico se encuentra deshabilitado, las salidas permanecen en estado bajo.
+
 ### Módulo 
 ### Módulo 
 ### Programa del Sistema
