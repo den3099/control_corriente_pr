@@ -2,7 +2,7 @@ module AXI_LITE_INTERFACE (
 
     input logic clk,
     input logic rst,
-
+        
     // Write Address Channel
     input  logic [31:0] s_axi_awaddr,
     input  logic        s_axi_awvalid,

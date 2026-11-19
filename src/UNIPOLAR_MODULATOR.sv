@@ -92,16 +92,13 @@ module UNIPOLAR_MODULATOR (
 
     always_comb begin
 
-        raw_pwm_A = 1'b0;
-        raw_pwm_B = 1'b0;
+        raw_pwm_A = enable &&
+                    (max_count != 0) &&
+                    ({1'b0, carrier} < threshold_a);
 
-        if (enable && (max_count != 0)) begin
-
-            raw_pwm_A = ({1'b0, carrier} < threshold_a);
-
-            raw_pwm_B = ({1'b0, carrier} < threshold_b);
-
-        end
+        raw_pwm_B = enable &&
+                    (max_count != 0) &&
+                    ({1'b0, carrier} < threshold_b);
 
     end
 

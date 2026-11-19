@@ -34,8 +34,11 @@ module PWM_CONTROLLER (
     output logic pwm_AH,
     output logic pwm_AL,
     output logic pwm_BH,
-    output logic pwm_BL
-
+    output logic pwm_BL,
+    
+    //Entradas de Proteccion
+    input logic [2:0] s_axi_awprot,
+    input logic [2:0] s_axi_arprot
 );
 
     // ------------------------------------------------
@@ -81,7 +84,7 @@ module PWM_CONTROLLER (
     AXI_LITE_INTERFACE AXI_INTERFACE (
 
         .clk(clk),
-        .rst(rst),
+        .rst(!rst),
 
         .s_axi_awaddr(s_axi_awaddr),
         .s_axi_awvalid(s_axi_awvalid),
@@ -122,7 +125,7 @@ module PWM_CONTROLLER (
     PWM_REGISTERS REGISTERS (
 
         .clk(clk),
-        .rst(rst),
+        .rst(!rst),
 
         .wr_en(wr_en),
         .wr_addr(wr_addr),
@@ -146,7 +149,7 @@ module PWM_CONTROLLER (
     PWM_FREQUENCY_GENERATOR FREQUENCY_GENERATOR (
 
         .clk(clk),
-        .rst(rst),
+        .rst(!rst),
         .enable(running),
         .freq_sel(freq_sel),
 
@@ -182,7 +185,7 @@ module PWM_CONTROLLER (
     ) DEAD_TIME (
 
         .clk(clk),
-        .rst(rst),
+        .rst(!rst),
         .enable(running),
 
         .raw_pwm_A(raw_pwm_A),
