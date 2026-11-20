@@ -184,23 +184,121 @@ El lazo principal atiende los botones: BTN0 exporta muestras, BTN1 inicia o deti
 
 `cambios1.txt` propone guardar el histórico en `int16_t`, reconstruir la senoide desde una tabla de un cuarto de período y sustituir `sinf` y `sqrtf` por aproximaciones. Estos cambios aún no están aplicados en el archivo principal recibido y se consideran una propuesta de reducción de memoria y dependencia de funciones matemáticas.
 
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Presentación de resultados
+
+La verificación se realizó mediante tres bancos autocomprobables en SystemVerilog, ejecutados en Vivado con un reloj de 100 MHz.
+
+### Módulo Árbitro
+
+El bloque formado por `traductor_direcciones` y `mux_lectura` se ensayó como una implementación auxiliar para decodificar direcciones y devolver la respuesta del periférico seleccionado. Para la arquitectura del sistema se prevé resolver esta función mediante una IP de interconexión AXI de Vivado.
+
+Se utilizaron modelos de cuatro periféricos y se comprobaron la selección exclusiva de destino, las respuestas ante esperas y el tratamiento de direcciones no mapeadas.
+
+| Banco | Comprobaciones aprobadas | Fallidas |
+| --- | ---: | ---: |
+| Multiplexor de lectura | 125 | 0 |
+| Traductor de direcciones | 152 | 0 |
+
+Como evidencia de escritura parcial, el registro del modelo GPIO en el offset `0x10` conservó los bytes no habilitados por `WSTRB`:
+
+| Comprobación (ns) | WDATA | WSTRB | Valor esperado y obtenido |
+| ---: | --- | --- | --- |
+| 1250 | `FFFFFFFF` | `1111` | `FFFFFFFF` |
+| 1320 | `12345678` | `0101` | `FF34FF78` |
+| 1390 | `AABBCCDD` | `1000` | `AA34FF78` |
+
+Los resultados corresponden al RTL auxiliar con modelos de prueba y no a una simulación de la IP de interconexión del sistema.
+
+### Módulo PWM
+
+El periférico PWM, implementado en `PWM_CONTROLLER`, genera las cuatro señales de accionamiento del puente H, `pwm_AH`, `pwm_AL`, `pwm_BH` y `pwm_BL`. Recibe del MicroBlaze V una referencia de modulación mediante AXI4-Lite, junto con los parámetros de habilitación y frecuencia. Su funcionamiento depende del reloj `clk`, del reinicio externo `rst`, activo en bajo en la versión simulada, y de la configuración escrita por el programa de control.
+
+Internamente, integra cinco submódulos.
+
+- **`AXI_LITE_INTERFACE`** recibe las solicitudes de lectura y escritura del procesador y permite acceder al banco de registros.
+
+- **`PWM_REGISTERS`** almacena la habilitación, la selección de frecuencia y la referencia. También permite consultar `running`, que indica una configuración habilitada con frecuencia válida.
+
+- **`PWM_FREQUENCY_GENERATOR`** genera una portadora triangular mediante un contador ascendente y descendente. Con un reloj de 100 MHz, permite seleccionar frecuencias de 5, 10 y 20 kHz.
+
+- **`UNIPOLAR_MODULATOR`** utiliza `duty_ref`, una referencia de 16 bits con signo en formato Q1.15, para calcular los umbrales de ambas ramas. Al compararlos con la portadora obtiene `raw_pwm_A` y `raw_pwm_B`.
+
+- **`DEAD_TIME_GENERATOR`** procesa estas señales e inserta un intervalo con ambas salidas de cada rama en bajo antes de activar la salida correspondiente. El tiempo muerto se fija en 50 ciclos, equivalentes a 500 ns a 100 MHz.
+
+La configuración se organiza en dos registros, cuyos offsets se suman a la dirección base del periférico.
+
+| Offset | Registro | Campos |
+| --- | --- | --- |
+| `0x00` | Control y estado | `enable` en el bit 0, `freq_sel` en los bits [2:1] y `running` de solo lectura en el bit 3. |
+| `0x04` | Referencia | `duty_ref` en los bits [15:0]. |
+
+Una vez habilitado, el PWM continúa funcionando con la referencia almacenada mientras el procesador realiza otras tareas. Sus salidas se entregan a la interfaz de accionamiento del puente H. Cuando se deshabilita o `rst=0`, las cuatro salidas permanecen en bajo.
+
+En la versión recibida quedan pendientes la incorporación de `pwm_trigger_o`, la saturación de escrituras y la validación de los cambios de frecuencia durante la operación.
+
+**Verificación del PWM.** El banco básico comprobó el estado deshabilitado posterior al reset, la habilitación por AXI, la selección de frecuencia y la escritura/lectura de `duty_ref=0x4000`. Las pruebas de selección compararon el valor interno `max_count` con los límites indicados en la tabla. Los períodos se calculan mediante `T_PWM = 2·max_count·T_clk`, con `T_clk=10 ns`; son valores teóricos, no períodos medidos por este banco.
+
+| Frecuencia seleccionada | max_count verificado por comparación | Período teórico | Resultado de la comprobación |
+| --- | ---: | ---: | --- |
+| 5 kHz | 10 000 | 200 µs | Aprobada |
+| 10 kHz | 5000 | 100 µs | Aprobada |
+| 20 kHz | 2500 | 50 µs | Aprobada |
+
+El banco tomó 1000 muestras de las salidas, una por ciclo de reloj, sin detectar activación simultánea de los interruptores de una misma rama. Finalmente se comprobó que la deshabilitación dejara las cuatro salidas en cero. Evidencia seleccionada:
+
+```text
+[EXITO] Prueba 1: El PWM inicia deshabilitado
+[EXITO] Prueba 6: Escritura y lectura de duty_ref
+[EXITO] Prueba 7: No hay activacion simultanea en una misma rama
+[EXITO] Prueba 8: Las salidas PWM se apagan al deshabilitar
+```
+
+Las ocho comprobaciones finalizaron aprobadas. Los registros documentados no incluyen la ejecución del banco integral; por ello, no se presenta una medición del período ni de los 50 ciclos de tiempo muerto.
+
 ## Análisis de resultados
 
 ### Módulo Procesador
 
+Las ejecuciones documentadas utilizan maestros de prueba, sin ejecutar un ELF en MicroBlaze V. Por tanto, no permiten determinar la duración de la ISR, el jitter del muestreo ni el cumplimiento temporal del lazo PR.
+
 ### Módulo Árbitro
 
-### Módulo
+Las 125 comprobaciones de lectura y 152 del traductor respaldan la selección exclusiva de destino y el manejo de respuestas bajo las condiciones ensayadas. La secuencia `FFFFFFFF → FF34FF78 → AA34FF78` confirma la conservación de bytes no habilitados; los estados `rd_busy=0 → 1 → 0` muestran el control de ocupación de lectura. La compatibilidad con las IP reales sigue pendiente: los modelos aceptan AW y W independientemente, mientras que AXI GPIO requiere ambos VALID simultáneos. [5]
 
-### Módulo
+### Módulo PWM
 
-### Módulo
+Las ocho comprobaciones verifican configuración, referencia y apagado de salidas. La selección de `max_count` concuerda con las frecuencias previstas, pero no demuestra el período efectivo ni los transitorios de cambio. Las 1000 muestras cubren aproximadamente 10 µs, menos que un período de 20 kHz; la ausencia de solapamiento se limita a ese intervalo. El tiempo muerto nominal de 500 ns necesita una medición específica.
 
-### Programa del Sistema
+### Módulos GPIO y UART
+
+No se evaluaron las IP reales ni la transferencia de muestras a la computadora. Su validación requiere aplicar las pruebas propuestas a la configuración implementada.
+
+### Módulos ADC/XADC, temporizador y controlador de interrupciones
+
+No hay evidencia de conversión, interrupciones ni sincronización con el PWM. Estos aspectos permanecen pendientes de la simulación del subsistema integrado.
 
 ---
 
 ### Conclusión
+
+El proyecto definió una arquitectura modular para el control de corriente de un inversor monofásico mediante un regulador PR discreto sobre MicroBlaze V. La propuesta asigna al firmware el cálculo de la acción de control y al PWM personalizado la generación de señales unipolares con tiempo muerto. La interconexión AXI4-Lite y el aprovechamiento de IP de Vivado permiten organizar la adquisición, la temporización y la comunicación, concentrando el desarrollo específico en el algoritmo de control y el periférico PWM.
+
+Esta organización establece la base para coordinar la medición de corriente, el cálculo del PR y la actualización de la modulación, además de almacenar muestras y transferirlas al computador para su visualización. El cumplimiento del objetivo general requiere completar la integración sobre FPGA y validar la sincronización del lazo y el seguimiento de la referencia sinusoidal de 50 Hz.
 
 ---
 
