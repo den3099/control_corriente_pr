@@ -1,17 +1,17 @@
 #include <stdio.h>
-#include <math.h>
-#include "platform.h"
+//#include "platform.h"
 #include "xil_printf.h"
 #include "xil_exception.h"
 #include "xparameters.h"
 #include "xintc.h"
 #include "xtmrctr.h"
+#include "xparameters.h"
 
 // MAPA DE MEMORIA
-#define GPIO_BASE_ADDR   0x40010000
-#define ADC_BASE_ADDR    0x40020000
-#define PWM_BASE_ADDR    0x40030000
-#define UART_BASE_ADDR   0x40040000
+#define GPIO_BASE_ADDR   0x40000000
+#define ADC_BASE_ADDR    0x44A10000
+#define PWM_BASE_ADDR    0x80000000
+#define UART_BASE_ADDR   0x40600000
 
 /* Timer e INTC se manejan con los drivers de Xilinx; sus IDs salen de
  * xparameters.h [AJUSTAR]                                                 */
@@ -65,13 +65,15 @@ static const int FSW_HZ[NUM_FSW] = {5000, 10000, 20000};
 #define DUTY_MAX         29491
 #define DUTY_MIN        (-29491)
 
-// ADC
-#define ADC_MASK         0xF
-#define ADC_START_INIT   0
-#define ADC_HW_TRIGGER   1
-#define ADC_TIMEOUT      2000
-#define ADC_OFFSET_CNT   8
-#define ADC_A_PER_CNT    0.125f
+// ADC / XADC
+#define ADC_STATUS_OFFSET  0x04
+#define ADC_AUX3_OFFSET    0x24C
+#define ADC_EOS_MASK       0x80
+#define ADC_DATA_MASK      0xFFF0
+
+#define ADC_TIMEOUT        2000
+#define ADC_OFFSET_CNT     8
+#define ADC_A_PER_CNT      0.125f
 
 // Controlador PR
 #define VDC              24.0f
@@ -115,7 +117,7 @@ static const float AMPL_A[3] = {0.2f, 0.5f, 1.0f};
 #define BTN_FSW          0x8          /* BTN3: ciclar frecuencia            */
 
 // Buffer circular
-#define LOG_LEN          2048
+#define LOG_LEN          256
 
 // Codigos de retorno de la inicializacion
 #define INIT_OK          0
@@ -140,11 +142,12 @@ static volatile int ampl_idx    = AMPL_INIT_IDX;
 static volatile int ampl_pending = -1;
 static volatile int pr_enabled  = 0;
 
-static float sine_lut[SINE_MAX];
+#define SINE_QUARTER_LEN (SINE_MAX / 4) 
+static int16_t sine_lut[SINE_QUARTER_LEN + 1];
 static int   sine_len = 200;
 static int   sine_idx = 0;
 
-static int log_mA[LOG_LEN];
+static int16_t log_mA[LOG_LEN];
 static volatile int log_head   = 0;
 static volatile int log_count  = 0;
 static volatile int log_frozen = 0;
@@ -170,11 +173,21 @@ static float pr_kp = 0.0f;
 static float pr_e1 = 0.0f, pr_e2 = 0.0f;       // e[k-1], e[k-2]
 static float pr_y1 = 0.0f, pr_y2 = 0.0f;       // yr[k-1], yr[k-2]
 
+
 // Kp = sqrt(R^2 + (2*pi*fc*L)^2)
 static void pr_design(void)
 {
     float x = 2.0f * 3.14159265f * PR_FC_HZ * L_LOAD_H;
-    pr_kp = sqrtf(R_LOAD_OHM * R_LOAD_OHM + x * x) / VDC;
+    float radicand = R_LOAD_OHM * R_LOAD_OHM + x * x;
+    float root;
+    int i;
+
+    /* Newton-Raphson: aproxima sqrt(radicand) sin biblioteca matematica. */
+    root = (radicand > 1.0f) ? (radicand * 0.1f) : 1.0f;
+    for (i = 0; i < 8; i++)
+        root = 0.5f * (root + radicand / root);
+
+    pr_kp = root / VDC;
 }
 
 // Estados en cero
@@ -230,15 +243,23 @@ static void pwm_disable(void)
 static int adc_read(int *raw)
 {
     int n;
-#if !ADC_HW_TRIGGER
-    adc_base[ADC_CTRL_IDX] = 1;
-#endif
+    int status;
+    int data;
+
     for (n = 0; n < ADC_TIMEOUT; n++) {
-        if (adc_base[ADC_STAT_IDX] & 0x1) {
-            *raw = adc_base[ADC_DATA_IDX] & ADC_MASK;
+
+        status = adc_base[ADC_STATUS_OFFSET / 4];
+
+        if (status & ADC_EOS_MASK) {
+
+            data = adc_base[ADC_AUX3_OFFSET / 4];
+
+            *raw = (data & ADC_DATA_MASK) >> 4;
+
             return 1;
         }
     }
+
     return 0;
 }
 
@@ -269,11 +290,40 @@ static void timing_reset(void)
 static void sine_build(int len)
 {
     int i;
+    int quarter;
+
     if (len > SINE_MAX) len = SINE_MAX;
-    for (i = 0; i < len; i++)
-        sine_lut[i] = sinf(6.2831853f * (float)i / (float)len);
+    if (len < 4) len = 4;
+
+    quarter = len / 4;
+    for (i = 0; i <= quarter; i++) {
+        float x = (float)i / (2.0f * (float)quarter);
+        float product = x * (1.0f - x);
+        float value = (16.0f * product) / (5.0f - 4.0f * product);
+
+        if (value > 1.0f) value = 1.0f;
+        sine_lut[i] = (int16_t)(value * 32767.0f + 0.5f);
+    }
+
     sine_len = len;
     sine_idx = 0;
+}
+
+static float sine_get(int idx)
+{
+    int quarter = sine_len / 4;
+    int16_t sample;
+
+    if (idx < quarter)
+        sample = sine_lut[idx];
+    else if (idx < 2 * quarter)
+        sample = sine_lut[2 * quarter - idx];
+    else if (idx < 3 * quarter)
+        sample = (int16_t)(-sine_lut[idx - 2 * quarter]);
+    else
+        sample = (int16_t)(-sine_lut[4 * quarter - idx]);
+
+    return (float)sample / 32767.0f;
 }
 
 // ISR DEL LAZO DE CONTROL
@@ -310,7 +360,7 @@ static void control_isr(void *ref, u8 tmr_num)
         ampl_pending = -1;
     }
 #endif
-    ref_A = AMPL_A[ampl_idx] * sine_lut[sine_idx];
+    ref_A = AMPL_A[ampl_idx] * sine_get(sine_idx);
     sine_idx++;
     if (sine_idx >= sine_len) sine_idx = 0;
 
@@ -414,11 +464,13 @@ static void leds_init(void)
 
 static int adc_init(void)
 {
-    adc_base[ADC_CTRL_IDX] = ADC_START_INIT;
-    if (adc_base[ADC_STAT_IDX] & 0x1) {
-        (void) adc_base[ADC_DATA_IDX];
-        if (adc_base[ADC_STAT_IDX] & 0x1) return INIT_ERR_ADC;
-    }
+    volatile int status;
+
+    // Comprobar acceso al registro de estado del XADC
+    status = adc_base[ADC_STATUS_OFFSET / 4];
+
+    (void)status;
+
     return INIT_OK;
 }
 
@@ -548,7 +600,7 @@ int main()
 {
     int st, ev, next;
 
-    init_platform();
+    //init_platform();
 
     st = system_init();
     if (st != INIT_OK) {
@@ -588,6 +640,6 @@ int main()
         if (ev & BTN_EXPORT) export_samples();
     }
 
-    cleanup_platform();
+    //cleanup_platform();
     return 0;
 }
