@@ -29,7 +29,8 @@ Implementación de un sistema de control de corriente para un inversor monofási
 ## Estructura del Repositorio
 
 -   `/docs`: Contiene la documentación del proyecto.
--   `/img`: Contiene imágenes utilizadas en la documentación.
+-   `/design`: Contiene imágenes utilizadas en la documentación.
 -   `/src`: Contiene el código fuente del proyecto.
+-   `/sw`: Contiene el código en lenguaje C del proyecto.
 -   `/test`: Contiene las pruebas realizadas al código fuente del
     proyecto.
