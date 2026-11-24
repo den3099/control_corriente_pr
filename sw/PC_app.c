@@ -1,645 +1,564 @@
-#include <stdio.h>
-//#include "platform.h"
-#include "xil_printf.h"
-#include "xil_exception.h"
+#include <stdint.h>
 #include "xparameters.h"
+#include "xil_exception.h"
 #include "xintc.h"
 #include "xtmrctr.h"
-#include "xparameters.h"
 
-// MAPA DE MEMORIA
-#define GPIO_BASE_ADDR   0x40000000
-#define ADC_BASE_ADDR    0x44A10000
-#define PWM_BASE_ADDR    0x80000000
-#define UART_BASE_ADDR   0x40600000
+/* 1 = lazo PR habilitable mediante BTN1; inicio NO es automatico.
+ * Para pruebas sin etapa de potencia, usar 0U.
+ */
+#define HABILITAR_POTENCIA      1U
 
-/* Timer e INTC se manejan con los drivers de Xilinx; sus IDs salen de
- * xparameters.h [AJUSTAR]                                                 */
-#define TMR_DEVICE_ID    0
-#define INTC_DEVICE_ID   0
-#define TMR_INTR_ID      0            /* numero de interrupcion en el INTC */
+#define GPIO_BASE              XPAR_XGPIO_0_BASEADDR
+#define UART_BASE              XPAR_XUARTLITE_0_BASEADDR
+#define TIMER_BASE             XPAR_XTMRCTR_0_BASEADDR
+#define INTC_BASE              XPAR_XINTC_0_BASEADDR
+#define XADC_BASE              XPAR_XSYSMON_0_BASEADDR
+#define PWM_BASE               XPAR_PWM_CONTROLLER_0_BASEADDR
+#define CPU_HZ                 XPAR_MICROBLAZE_RISCV_FREQ
+#define RAM_LOCAL_BYTES        (XPAR_LMB_BRAM_0_HIGHADDRESS - XPAR_LMB_BRAM_0_BASEADDRESS + 1U)
 
-// INDICES DE REGISTROS
-#define PWM_CTRL_IDX     0
-#define PWM_DUTY_IDX     1
-#define PWM_EN_BIT       0x1
-#define PWM_FSEL_SHIFT   1
-#define PWM_FSEL_MASK    0x6
-#define PWM_RUN_BIT      0x8
+#if RAM_LOCAL_BYTES != 32768U
+#error "Se requieren 32 KiB de memoria local segun el proyecto"
+#endif
 
-// ADC [VERIFICAR: supuesto, adaptar al mapa de registros de tu IP] */
-#define ADC_CTRL_IDX     0            /* offset 0x00: bit0 = start     */
-#define ADC_STAT_IDX     1            /* offset 0x04: bit0 = data_valid */
-#define ADC_DATA_IDX     2            /* offset 0x08: dato              */
+#ifdef SDT
+#define TIMER_ID               TIMER_BASE
+#define INTC_ID                INTC_BASE
+#else
+#define TIMER_ID               XPAR_AXI_TIMER_0_DEVICE_ID
+#define INTC_ID                XPAR_MICROBLAZE_RISCV_0_AXI_INTC_DEVICE_ID
+#endif
 
-// GPIO
-#define GPIO_DATA_IDX      0
-#define GPIO_TRI_IDX       1
-#define GPIO_LED_DATA_IDX  2
-#define GPIO_LED_TRI_IDX   3
-#define GPIO_CONFIG_TRI    0
+/* Registros PWM: control +0x00, duty firmado Q1.15 +0x04. */
+#define PWM_CTRL               0U
+#define PWM_DUTY               1U
+#define PWM_EN                 1U
+#define PWM_RUNNING            0x08U
+#define PWM_FSEL_SHIFT         1U
+#define DUTY_MAX_Q15           29491L       /* modulacion maxima +/-0.90 */
 
-// UART
-#define UART_RX_IDX      0
-#define UART_TX_IDX      1
-#define UART_STAT_IDX    2
-#define UART_CTRL_IDX    3
-#define UART_RST_TX      0x01
-#define UART_RST_RX      0x02
-#define UART_RX_VALID    0x01
+/* XADC Wizard, VAUX3; registro de datos desplaza 4 bits. */
+#define XADC_SR                (0x04U / 4U)
+#define XADC_CONVST            (0x0CU / 4U)
+#define XADC_VAUX3             (0x24CU / 4U)
+#define XADC_EOC               0x20U
+#define XADC_CHANNEL_MASK      0x1FU
+#define XADC_CHANNEL_VAUX3     0x13U
 
-// VALORES INICIALES Y PARAMETROS
-#define CPU_HZ           100000000
+/* Calibracion nominal y restricciones sobre la senal ANALOGICA. */
+#define ADC_CERO               2048L
+#define ADC_NUM_MA             625L
+#define ADC_DEN_MA             1152L
+#define ADC_RAW_MIN            207U         /* ~0.0505 V */
+#define ADC_RAW_MAX            3891U        /* ~0.9500 V */
+#define ADC_CERO_TOL           96U          /* ~50 mA alrededor del cero */
+#define ADC_RANGO_REPOSO       40U          /* dispersion maxima en 8 muestras */
+#define CORRIENTE_MAX_MA       1000L
 
-// PWM
-#define NUM_FSW          3
-static const int FSW_HZ[NUM_FSW] = {5000, 10000, 20000};
-#define PWM_FSEL_INIT    1
-#define PWM_ENABLE_INIT  0
-#define PWM_DUTY_INIT    0
-#define PWM_RUN_TIMEOUT  1000
+/* AXI UART Lite, 9600 8N1; comunicacion solo bajo peticion por botones. */
+#define UART_TX                1U           /* +0x04 */
+#define UART_SR                2U           /* +0x08 */
+#define UART_TX_FULL           0x08U
 
-#define PR_DESIGN_FSW_IDX 1
+/* Canal 1: botones; canal 2: 16 LEDs. */
+#define BTN_EXPORT             0x01U
+#define BTN_START              0x02U
+#define BTN_AMP                0x04U
+#define BTN_FREQ               0x08U
+#define BTN_MASK               0x1FU
+#define LED_LISTO              0x01U
+#define LED_MARCHA             0x02U
+#define LED_FALLA              0x04U
 
-#define DUTY_FULL_SCALE  32768.0f
-#define DUTY_MAX         29491
-#define DUTY_MIN        (-29491)
+#define PARADO                  0U
+#define ACTIVO                  1U
+#define FALLA                   2U
+#define ERR_ADC                 1U
+#define ERR_SOBRECORRIENTE      2U
+#define ERR_PWM                 3U
+#define ERR_TIEMPO_ISR          4U
+#define ERR_TIMER               5U
 
-// ADC / XADC
-#define ADC_STATUS_OFFSET  0x04
-#define ADC_AUX3_OFFSET    0x24C
-#define ADC_EOS_MASK       0x80
-#define ADC_DATA_MASK      0xFFF0
+/* Regulador PR: Kp=1.996684, Kr=100, wc=5 rad/s, 50 Hz.
+ * Coeficientes Q20 discretizados de forma independiente para cada fsw.
+ */
+#define Q20                     1048576LL
+#define KP_Q20                  2093675LL
+#define ESTADO_ESCALA           256L
+#define ESTADO_LIM              (8000L * ESTADO_ESCALA)
+#define U_ESTADO_LIM            (900L * ESTADO_ESCALA)
+#define HIST_N                  1024U
 
-#define ADC_TIMEOUT        2000
-#define ADC_OFFSET_CNT     8
-#define ADC_A_PER_CNT      0.125f
+static volatile uint32_t *const gpio = (volatile uint32_t *)GPIO_BASE;
+static volatile uint32_t *const uart = (volatile uint32_t *)UART_BASE;
+static volatile uint32_t *const xadc = (volatile uint32_t *)XADC_BASE;
+static volatile uint32_t *const pwm  = (volatile uint32_t *)PWM_BASE;
 
-// Controlador PR
-#define VDC              24.0f
-#define R_LOAD_OHM       4.7f
-#define L_LOAD_H         0.0253f
-#define PR_FC_HZ         300.0f
+static XTmrCtr timer;
+static XIntc intc;
+static const uint16_t fsw[3] = {5000, 10000, 20000};
+static const uint16_t fase_paso[3] = {4, 2, 1};
+static const int16_t amplitud_mA[3] = {200, 500, 1000};
+static const int32_t b0_q20[3] = {104684, 52394, 26207};
+static const int32_t a1_q20[3] = {-2090924, -2095070, -2096369};
+static const int32_t a2_q20[3] = {1046482, 1047528, 1048052};
 
-#define PR_B0            0.049966796f
-#define PR_B2           (-0.049966796f)
-#define PR_A1           (-1.998014278f)
-#define PR_A2            0.999000664f
-#define PR_UMAX          0.9f
+/* Cuarto de seno, Q15, fase de 0..399 (400 pasos/ciclo). */
+static const int16_t seno_q15[101] = {
+       0,   515,  1029,  1544,  2057,  2571,  3084,  3596,  4107,  4617,
+    5126,  5634,  6140,  6645,  7148,  7649,  8149,  8646,  9142,  9635,
+   10126, 10614, 11099, 11582, 12062, 12539, 13013, 13484, 13952, 14415,
+   14876, 15333, 15786, 16235, 16680, 17121, 17557, 17990, 18418, 18841,
+   19260, 19674, 20083, 20487, 20886, 21280, 21669, 22053, 22431, 22803,
+   23170, 23531, 23886, 24235, 24579, 24916, 25247, 25572, 25891, 26203,
+   26509, 26808, 27101, 27387, 27666, 27938, 28204, 28462, 28714, 28958,
+   29196, 29426, 29648, 29864, 30072, 30273, 30466, 30652, 30830, 31000,
+   31163, 31318, 31466, 31606, 31738, 31862, 31978, 32086, 32187, 32279,
+   32364, 32440, 32509, 32569, 32622, 32666, 32702, 32731, 32751, 32763,
+   32767
+};
 
-// Referencia y proteccion
-#define F_REF_HZ         50
-#define SINE_MAX         400
-static const float AMPL_A[3] = {0.2f, 0.5f, 1.0f};
-#define AMPL_INIT_IDX    0
-#define AMPL_CHANGE_AT_PEAK 1
-#define I_LIMIT_A        1.5f
+/* Datos indispensables para el control y el historial. */
+static int16_t hist_ref[HIST_N];
+static int16_t hist_i[HIST_N];
+static volatile uint16_t hist_pos = 0U, hist_total = 0U;
+static volatile uint32_t estado = PARADO, causa = 0U;
+static volatile uint32_t interrupciones = 0U;
+static volatile uint32_t modo_f = 1U, modo_amp = 0U;
+static volatile uint32_t pendiente_amp = 3U; /* 3 = sin cambio pendiente */
+static volatile uint32_t rampa_mA = 0U;
+static uint32_t rampa_ciclos = 0U;
+static uint32_t periodo_ciclos = 10000U;
+static uint32_t ultimo_inicio_isr = 0U;
+static uint16_t fase = 0U;
+static int32_t b0 = 52394, a1 = -2095070, a2 = 1047528;
+static int32_t e1 = 0, e2 = 0, y1 = 0, y2 = 0;
+static uint8_t hist_salto = 0U;
 
-// Temporizacion
-#define NS_PER_CYCLE     (1000000000 / CPU_HZ)
-#define TIMER_ALIGN_CYCLES 500
-
-// LED de estado
-#define SYS_INIT         0
-#define SYS_WORK         1
-#define SYS_FAULT        2
-#define LED_OFF          0x0
-#define LED_ST_INIT      0x1
-#define LED_ST_WORK      0x2
-#define LED_ST_FAULT     0x4
-#define AUTO_START       1
-
-// Botones
-#define BTN_MASK         0xF
-#define BTN_EXPORT       0x1          /* BTN0: exportar muestras            */
-#define BTN_ENABLE       0x2          /* BTN1: iniciar/detener control      */
-#define BTN_AMPL         0x4          /* BTN2: ciclar amplitud              */
-#define BTN_FSW          0x8          /* BTN3: ciclar frecuencia            */
-
-// Buffer circular
-#define LOG_LEN          256
-
-// Codigos de retorno de la inicializacion
-#define INIT_OK          0
-#define INIT_ERR_PWM    -1
-#define INIT_ERR_ADC    -2
-#define INIT_ERR_BTN    -3
-#define INIT_ERR_UART   -4
-#define INIT_ERR_IRQ    -5
-
-// PUNTEROS
-static volatile int * gpio_base = (volatile int *) GPIO_BASE_ADDR;
-static volatile int * adc_base  = (volatile int *) ADC_BASE_ADDR;
-static volatile int * pwm_base  = (volatile int *) PWM_BASE_ADDR;
-static volatile int * uart_base = (volatile int *) UART_BASE_ADDR;
-
-static XTmrCtr tmr;
-static XIntc   intc;
-
-static volatile int sys_state   = SYS_INIT;
-static volatile int fsw_idx     = PWM_FSEL_INIT;
-static volatile int ampl_idx    = AMPL_INIT_IDX;
-static volatile int ampl_pending = -1;
-static volatile int pr_enabled  = 0;
-
-#define SINE_QUARTER_LEN (SINE_MAX / 4) 
-static int16_t sine_lut[SINE_QUARTER_LEN + 1];
-static int   sine_len = 200;
-static int   sine_idx = 0;
-
-static int16_t log_mA[LOG_LEN];
-static volatile int log_head   = 0;
-static volatile int log_count  = 0;
-static volatile int log_frozen = 0;
-
-// Botones
-static int btn_prev = 0;
-static int btn_last = 0;
-static int btn_t_change = 0;
-static volatile int isr_ticks = 0;
-static int debounce_ticks = 0;
-
-static volatile int ts_ticks     = 0;
-static volatile int timing_valid = 0;
-static unsigned int t_last       = 0;
-static volatile int dev_min      = 0;
-static volatile int dev_max      = 0;
-static volatile int dev_sum      = 0;
-static volatile int stat_n       = 0;
-static volatile int isr_max      = 0;
-
-// CONTROLADOR PR DISCRETO
-static float pr_kp = 0.0f;
-static float pr_e1 = 0.0f, pr_e2 = 0.0f;       // e[k-1], e[k-2]
-static float pr_y1 = 0.0f, pr_y2 = 0.0f;       // yr[k-1], yr[k-2]
-
-
-// Kp = sqrt(R^2 + (2*pi*fc*L)^2)
-static void pr_design(void)
+static void pwm_apagar(void)
 {
-    float x = 2.0f * 3.14159265f * PR_FC_HZ * L_LOAD_H;
-    float radicand = R_LOAD_OHM * R_LOAD_OHM + x * x;
-    float root;
-    int i;
-
-    /* Newton-Raphson: aproxima sqrt(radicand) sin biblioteca matematica. */
-    root = (radicand > 1.0f) ? (radicand * 0.1f) : 1.0f;
-    for (i = 0; i < 8; i++)
-        root = 0.5f * (root + radicand / root);
-
-    pr_kp = root / VDC;
+    pwm[PWM_CTRL] = modo_f << PWM_FSEL_SHIFT;
+    pwm[PWM_DUTY] = 0U;
 }
 
-// Estados en cero
-static void pr_reset(void)
+static void pr_reiniciar(void)
 {
-    pr_e1 = pr_e2 = 0.0f;
-    pr_y1 = pr_y2 = 0.0f;
+    e1 = e2 = y1 = y2 = 0;
+    fase = 0U;
+    rampa_mA = 0U;
+    rampa_ciclos = 0U;
+    pendiente_amp = 3U;
 }
 
-static int pr_step(float iref, float imeas)
+static void falla(uint32_t codigo)
 {
-    float e  = iref - imeas;
-    float yr = PR_B0 * e + PR_B2 * pr_e2 - PR_A1 * pr_y1 - PR_A2 * pr_y2;
-    float u  = pr_kp * e + yr;
-    float d;
-
-    pr_e2 = pr_e1;  pr_e1 = e;
-    pr_y2 = pr_y1;  pr_y1 = yr;
-
-    if (u >  PR_UMAX) u =  PR_UMAX;
-    if (u < -PR_UMAX) u = -PR_UMAX;
-
-    d = u * DUTY_FULL_SCALE;
-    return (int)(d >= 0.0f ? d + 0.5f : d - 0.5f);
+    pwm_apagar();
+    estado = FALLA;
+    causa = codigo;
+    gpio[2] = LED_FALLA;
 }
 
-// FUNCIONES
-static void leds_write(int value)
+/* UART: si FIFO se llena, abandonar por timeout en vez de congelar main. */
+static int uart_char(char c)
 {
-    gpio_base[GPIO_LED_DATA_IDX] = value;
+    uint32_t t0 = XTmrCtr_GetValue(&timer, 1);
+    while ((uart[UART_SR] & UART_TX_FULL) != 0U) {
+        if ((uint32_t)(XTmrCtr_GetValue(&timer, 1) - t0) > CPU_HZ / 20U)
+            return 0;
+    }
+    uart[UART_TX] = (uint32_t)(uint8_t)c;
+    return 1;
 }
 
-static void leds_show(int state)
+static void uart_texto(const char *s)
 {
-    if (state == SYS_WORK)       leds_write(LED_ST_WORK);
-    else if (state == SYS_FAULT) leds_write(LED_ST_FAULT);
-    else                         leds_write(LED_ST_INIT);
+    while (*s != '\0') {
+        if (!uart_char(*s++)) return;
+    }
 }
 
-static void pwm_write_duty(int duty)
+static void uart_u32(uint32_t n)
 {
-    if (duty > DUTY_MAX) duty = DUTY_MAX;
-    if (duty < DUTY_MIN) duty = DUTY_MIN;
-    pwm_base[PWM_DUTY_IDX] = duty & 0xFFFF;
+    char digitos[10];
+    uint32_t i = 0U;
+    do {
+        digitos[i++] = (char)('0' + (n % 10U));
+        n /= 10U;
+    } while (n != 0U);
+    while (i != 0U) {
+        if (!uart_char(digitos[--i])) return;
+    }
 }
 
-static void pwm_disable(void)
+static void uart_i32(int32_t n)
 {
-    pwm_base[PWM_DUTY_IDX] = 0;
-    pwm_base[PWM_CTRL_IDX] = (fsw_idx << PWM_FSEL_SHIFT);
+    if (n < 0) {
+        uart_texto("-");
+        uart_u32((uint32_t)(-(int64_t)n));
+    } else {
+        uart_u32((uint32_t)n);
+    }
 }
 
-static int adc_read(int *raw)
+/* El registro de estado SR entrega EOC y CHANNEL de VAUX3. */
+static int adc_esperar(uint16_t *dato, uint32_t timeout_ciclos)
 {
-    int n;
-    int status;
-    int data;
-
-    for (n = 0; n < ADC_TIMEOUT; n++) {
-
-        status = adc_base[ADC_STATUS_OFFSET / 4];
-
-        if (status & ADC_EOS_MASK) {
-
-            data = adc_base[ADC_AUX3_OFFSET / 4];
-
-            *raw = (data & ADC_DATA_MASK) >> 4;
-
+    uint32_t t0 = XTmrCtr_GetValue(&timer, 1);
+    do {
+        uint32_t sr = xadc[XADC_SR];
+        if ((sr & XADC_EOC) &&
+            ((sr & XADC_CHANNEL_MASK) == XADC_CHANNEL_VAUX3)) {
+            *dato = (uint16_t)((xadc[XADC_VAUX3] >> 4) & 0x0FFFU);
             return 1;
         }
-    }
-
+    } while ((uint32_t)(XTmrCtr_GetValue(&timer, 1) - t0) < timeout_ciclos);
     return 0;
 }
 
-static void delay_cycles(unsigned int cycles)
+static void adc_disparar_software(void)
 {
-    unsigned int t = XTmrCtr_GetValue(&tmr, 1);
-    while ((XTmrCtr_GetValue(&tmr, 1) - t) < cycles) { }
+    (void)xadc[XADC_SR];
+    xadc[XADC_CONVST] = 0U;
+    xadc[XADC_CONVST] = 1U;
+    xadc[XADC_CONVST] = 0U;
 }
 
-static void fault_trip(void)
+static int32_t adc_a_mA(uint16_t raw)
 {
-    pwm_disable();
-    pr_reset();
-    sys_state = SYS_FAULT;
-    leds_show(SYS_FAULT);
+    return (((int32_t)raw - ADC_CERO) * ADC_NUM_MA) / ADC_DEN_MA;
 }
 
-static void timing_reset(void)
+static int16_t seno(uint16_t p)
 {
-    timing_valid = 0;
-    dev_min  = 0x7FFFFFFF;
-    dev_max  = -0x7FFFFFFF;
-    dev_sum  = 0;
-    stat_n   = 0;
-    isr_max  = 0;
+    if (p <= 100U) return seno_q15[p];
+    if (p <= 200U) return seno_q15[200U - p];
+    if (p <= 300U) return (int16_t)-seno_q15[p - 200U];
+    return (int16_t)-seno_q15[400U - p];
 }
 
-static void sine_build(int len)
+static int32_t pr_paso(int32_t ref_mA, int32_t real_mA)
 {
-    int i;
-    int quarter;
+    int32_t e = (ref_mA - real_mA) * ESTADO_ESCALA;
+    int64_t acc = (int64_t)b0 * (e - e2)
+                - (int64_t)a1 * y1 - (int64_t)a2 * y2;
+    int32_t y = (int32_t)(acc / Q20);
+    int64_t u;
+    e2 = e1;
+    e1 = e;
+    if (y > ESTADO_LIM) y = ESTADO_LIM;
+    if (y < -ESTADO_LIM) y = -ESTADO_LIM;
+    y2 = y1;
+    y1 = y;
+    u = (int64_t)KP_Q20 * e / Q20 + y;
+    if (u > U_ESTADO_LIM) u = U_ESTADO_LIM;
+    if (u < -U_ESTADO_LIM) u = -U_ESTADO_LIM;
+    return ((int32_t)u * 128L) / 1000L;
+}
 
-    if (len > SINE_MAX) len = SINE_MAX;
-    if (len < 4) len = 4;
+/* Interrupcion de control */
+static void control_isr(void *contexto, u8 canal)
+{
+    uint32_t t0, duracion;
+    uint16_t raw;
+    int32_t corriente, referencia, duty;
+    (void)contexto;
+    if (canal != 0U) return;
+    ++interrupciones;
+    if (estado != ACTIVO) return;
 
-    quarter = len / 4;
-    for (i = 0; i <= quarter; i++) {
-        float x = (float)i / (2.0f * (float)quarter);
-        float product = x * (1.0f - x);
-        float value = (16.0f * product) / (5.0f - 4.0f * product);
-
-        if (value > 1.0f) value = 1.0f;
-        sine_lut[i] = (int16_t)(value * 32767.0f + 0.5f);
+    t0 = XTmrCtr_GetValue(&timer, 1);
+    if (ultimo_inicio_isr != 0U &&
+        (uint32_t)(t0 - ultimo_inicio_isr) > 2U * periodo_ciclos) {
+        falla(ERR_TIEMPO_ISR);
+        return;
     }
-
-    sine_len = len;
-    sine_idx = 0;
-}
-
-static float sine_get(int idx)
-{
-    int quarter = sine_len / 4;
-    int16_t sample;
-
-    if (idx < quarter)
-        sample = sine_lut[idx];
-    else if (idx < 2 * quarter)
-        sample = sine_lut[2 * quarter - idx];
-    else if (idx < 3 * quarter)
-        sample = (int16_t)(-sine_lut[idx - 2 * quarter]);
-    else
-        sample = (int16_t)(-sine_lut[4 * quarter - idx]);
-
-    return (float)sample / 32767.0f;
-}
-
-// ISR DEL LAZO DE CONTROL
-static void control_isr(void *ref, u8 tmr_num)
-{
-    float meas_A, ref_A;
-    int raw, duty, dev, dur;
-    unsigned int t0;
-
-    (void) ref; (void) tmr_num;
-    t0 = XTmrCtr_GetValue(&tmr, 1);
-    isr_ticks++;
-    if (sys_state != SYS_WORK) { timing_valid = 0; return; }
-
-    if (timing_valid) {
-        dev = (int)(t0 - t_last) - ts_ticks;
-        if (dev < dev_min) dev_min = dev;
-        if (dev > dev_max) dev_max = dev;
-        dev_sum += dev;
-        stat_n++;
+    ultimo_inicio_isr = t0;
+    if (!adc_esperar(&raw, periodo_ciclos / 4U)) {
+        falla(ERR_ADC);
+        return;
     }
-    timing_valid = 1;
-    t_last = t0;
-
-    if (!adc_read(&raw)) { fault_trip(); return; }
-
-    meas_A = (float)(raw - ADC_OFFSET_CNT) * ADC_A_PER_CNT;
-
-    if (meas_A > I_LIMIT_A || meas_A < -I_LIMIT_A) { fault_trip(); return; }
-
-#if AMPL_CHANGE_AT_PEAK
-    if (ampl_pending >= 0 && sine_idx == sine_len / 4) {
-        ampl_idx = ampl_pending;
-        ampl_pending = -1;
+    if (raw < ADC_RAW_MIN || raw > ADC_RAW_MAX) {
+        falla(ERR_ADC);
+        return;
     }
-#endif
-    ref_A = AMPL_A[ampl_idx] * sine_get(sine_idx);
-    sine_idx++;
-    if (sine_idx >= sine_len) sine_idx = 0;
-
-    if (pr_enabled) duty = pr_step(ref_A, meas_A);
-    else            duty = 0;
-    pwm_write_duty(duty);
-
-    if (!log_frozen) {
-        log_mA[log_head] = (int)(meas_A * 1000.0f);
-        log_head = (log_head + 1) & (LOG_LEN - 1);
-        if (log_count < LOG_LEN) log_count++;
-    }
-
-    dur = (int)(XTmrCtr_GetValue(&tmr, 1) - t0);
-    if (dur > isr_max) isr_max = dur;
-}
-
-// CONTROL
-static void control_stop(void)
-{
-    sys_state = SYS_INIT;
-    pwm_disable();
-    pr_reset();
-    leds_show(SYS_INIT);
-}
-
-static void control_start(void)
-{
-    int n;
-
-    pr_reset();
-    timing_reset();
-    sine_idx = 0;
-    ampl_pending = -1;
-    pwm_write_duty(PWM_DUTY_INIT);
-
-    XTmrCtr_Stop(&tmr, 0);
-    pwm_base[PWM_CTRL_IDX] = (fsw_idx << PWM_FSEL_SHIFT) | PWM_EN_BIT;
-
-    for (n = 0; n < PWM_RUN_TIMEOUT; n++)
-        if (pwm_base[PWM_CTRL_IDX] & PWM_RUN_BIT) break;
-    if (n == PWM_RUN_TIMEOUT) {
-        XTmrCtr_Start(&tmr, 0);
-        fault_trip();
+    corriente = adc_a_mA(raw);
+    if (corriente > CORRIENTE_MAX_MA || corriente < -CORRIENTE_MAX_MA) {
+        falla(ERR_SOBRECORRIENTE);
         return;
     }
 
-    delay_cycles(TIMER_ALIGN_CYCLES);
-    sys_state = SYS_WORK;
-    leds_show(SYS_WORK);
-    XTmrCtr_Start(&tmr, 0);
+    if (pendiente_amp < 3U && (fase == 0U || fase == 200U)) {
+        modo_amp = pendiente_amp;
+        pendiente_amp = 3U;
+    }
+    /* Suavizar escalones de corriente: 10 mA de incremento por ms. */
+    rampa_ciclos += periodo_ciclos;
+    if (rampa_ciclos >= CPU_HZ / 1000U) {
+        uint32_t objetivo = (uint32_t)amplitud_mA[modo_amp];
+        rampa_ciclos -= CPU_HZ / 1000U;
+        if (rampa_mA + 10U <= objetivo) rampa_mA += 10U;
+        else if (rampa_mA < objetivo) rampa_mA = objetivo;
+        else if (rampa_mA >= objetivo + 10U) rampa_mA -= 10U;
+        else rampa_mA = objetivo;
+    }
 
-    if (!pr_enabled)
-        xil_printf("Aviso: el PR esta disenado solo para fsw=%d Hz; PWM con duty=0\r\n",
-                   FSW_HZ[PR_DESIGN_FSW_IDX]);
+    referencia = ((int32_t)rampa_mA * seno(fase)) / 32767;
+    duty = pr_paso(referencia, corriente);
+    if (duty > DUTY_MAX_Q15) duty = DUTY_MAX_Q15;
+    if (duty < -DUTY_MAX_Q15) duty = -DUTY_MAX_Q15;
+    pwm[PWM_DUTY] = (uint32_t)(duty & 0xFFFF);
+
+    fase = (uint16_t)(fase + fase_paso[modo_f]);
+    if (fase >= 400U) fase = 0U;
+
+    ++hist_salto;
+    if (hist_salto >= ((modo_f == 2U) ? 2U : 1U)) {
+        hist_salto = 0U;
+        hist_ref[hist_pos] = (int16_t)referencia;
+        hist_i[hist_pos] = (int16_t)corriente;
+        hist_pos = (uint16_t)((hist_pos + 1U) & (HIST_N - 1U));
+        if (hist_total < HIST_N) ++hist_total;
+    }
+
+    duracion = (uint32_t)(XTmrCtr_GetValue(&timer, 1) - t0);
+    if (duracion >= periodo_ciclos) falla(ERR_TIEMPO_ISR);
 }
 
-static void control_reconfigure(int idx)
+static void control_detener(void)
 {
-    sys_state = SYS_INIT;
-    XTmrCtr_Stop(&tmr, 0);
-
-    fsw_idx = idx;
-    pwm_disable();
-
-    ts_ticks = CPU_HZ / FSW_HZ[idx];
-    XTmrCtr_SetResetValue(&tmr, 0, ts_ticks);
-    sine_build(FSW_HZ[idx] / F_REF_HZ);
-    pr_enabled = (idx == PR_DESIGN_FSW_IDX);
-    debounce_ticks = FSW_HZ[idx] / 50;
-    pr_reset();
-    timing_reset();
-
-    XTmrCtr_Start(&tmr, 0);
-    leds_show(SYS_INIT);
+    estado = PARADO;
+    pwm_apagar();
+    pr_reiniciar();
+    gpio[2] = LED_LISTO;
 }
 
-// INICIALIZACION
-static int pwm_init(void)
+static void frecuencia_elegir(uint32_t nueva)
 {
-    int ctrl;
-    pwm_base[PWM_DUTY_IDX] = PWM_DUTY_INIT;
-    pwm_base[PWM_CTRL_IDX] = (PWM_FSEL_INIT << PWM_FSEL_SHIFT)
-                           | (PWM_ENABLE_INIT ? PWM_EN_BIT : 0);
-    ctrl = pwm_base[PWM_CTRL_IDX];
-    if (ctrl & PWM_EN_BIT)  return INIT_ERR_PWM;
-    if (ctrl & PWM_RUN_BIT) return INIT_ERR_PWM;
-    if (((ctrl & PWM_FSEL_MASK) >> PWM_FSEL_SHIFT) != PWM_FSEL_INIT)
-        return INIT_ERR_PWM;
-    return INIT_OK;
+    uint32_t n;
+    if (estado != PARADO || nueva > 2U) return;
+    XTmrCtr_Stop(&timer, 0);
+    pwm_apagar();
+    modo_f = nueva;
+    n = CPU_HZ / fsw[nueva];
+    periodo_ciclos = n;
+    b0 = b0_q20[nueva];
+    a1 = a1_q20[nueva];
+    a2 = a2_q20[nueva];
+    pr_reiniciar();
+    hist_salto = 0U;
+    ultimo_inicio_isr = 0U;
+    pwm_apagar();
+    XTmrCtr_SetResetValue(&timer, 0, n - 2U);
+    XTmrCtr_Start(&timer, 0);
 }
 
-static void leds_init(void)
+static int adc_verificar_reposo(void)
 {
-#if GPIO_CONFIG_TRI
-    gpio_base[GPIO_LED_TRI_IDX] = 0x0;
-#endif
-    leds_write(LED_OFF);
-    leds_show(SYS_INIT);
+    uint32_t suma = 0U, minimo = 4095U, maximo = 0U;
+    uint32_t k, media;
+    for (k = 0U; k < 8U; ++k) {
+        uint16_t raw;
+        adc_disparar_software();
+        if (!adc_esperar(&raw, CPU_HZ / 100U)) return 0;
+        if (raw < minimo) minimo = raw;
+        if (raw > maximo) maximo = raw;
+        suma += raw;
+    }
+    media = suma / 8U;
+    if (minimo < ADC_RAW_MIN || maximo > ADC_RAW_MAX) return 0;
+    if (maximo - minimo > ADC_RANGO_REPOSO) return 0;
+    if (media > (uint32_t)ADC_CERO + ADC_CERO_TOL) return 0;
+    if (media + ADC_CERO_TOL < (uint32_t)ADC_CERO) return 0;
+    return 1;
 }
 
-static int adc_init(void)
+static void control_iniciar(void)
 {
-    volatile int status;
-
-    // Comprobar acceso al registro de estado del XADC
-    status = adc_base[ADC_STATUS_OFFSET / 4];
-
-    (void)status;
-
-    return INIT_OK;
+    uint16_t muestra;
+    if (estado != PARADO) return;
+    if (!HABILITAR_POTENCIA) {
+        uart_texto("BTN1: inicio bloqueado hasta verificar hardware.\r\n");
+        return;
+    }
+    pwm_apagar();
+    pr_reiniciar();
+    if (!adc_verificar_reposo()) {
+        falla(ERR_ADC);
+        return;
+    }
+    (void)xadc[XADC_SR];
+    pwm[PWM_DUTY] = 0U;
+    pwm[PWM_CTRL] = (modo_f << PWM_FSEL_SHIFT) | PWM_EN;
+    if ((pwm[PWM_CTRL] & PWM_RUNNING) == 0U) {
+        falla(ERR_PWM);
+        return;
+    }
+    if (!adc_esperar(&muestra, CPU_HZ / 100U)) {
+        falla(ERR_ADC);
+        return;
+    }
+    XTmrCtr_Stop(&timer, 0);
+    XTmrCtr_SetResetValue(&timer, 0, periodo_ciclos - 2U);
+    XTmrCtr_Start(&timer, 0);
+    ultimo_inicio_isr = 0U;
+    estado = ACTIVO;
+    gpio[2] = LED_MARCHA;
 }
 
-static int buttons_init(void)
+static int iniciar_interrupciones(void)
 {
-#if GPIO_CONFIG_TRI
-    gpio_base[GPIO_TRI_IDX] = BTN_MASK;
-#endif
-    btn_prev = btn_last = gpio_base[GPIO_DATA_IDX] & BTN_MASK;
-    if (btn_prev != 0) return INIT_ERR_BTN;
-    return INIT_OK;
-}
-
-static int uart_init(void)
-{
-    uart_base[UART_CTRL_IDX] = UART_RST_TX | UART_RST_RX;
-    if (uart_base[UART_STAT_IDX] & UART_RX_VALID) return INIT_ERR_UART;
-    return INIT_OK;
-}
-
-static int interrupts_init(void)
-{
-    int st;
-
-    st = XTmrCtr_Initialize(&tmr, TMR_DEVICE_ID);
-    if (st != XST_SUCCESS) return INIT_ERR_IRQ;
-    XTmrCtr_SetOptions(&tmr, 0, XTC_INT_MODE_OPTION | XTC_AUTO_RELOAD_OPTION
-                                | XTC_DOWN_COUNT_OPTION);
-    XTmrCtr_SetHandler(&tmr, control_isr, &tmr);
-
-    XTmrCtr_SetOptions(&tmr, 1, 0);
-    XTmrCtr_SetResetValue(&tmr, 1, 0);
-    XTmrCtr_Start(&tmr, 1);
-
-    st = XIntc_Initialize(&intc, INTC_DEVICE_ID);
-    if (st != XST_SUCCESS) return INIT_ERR_IRQ;
-    st = XIntc_Connect(&intc, TMR_INTR_ID,
-                       (XInterruptHandler) XTmrCtr_InterruptHandler, &tmr);
-    if (st != XST_SUCCESS) return INIT_ERR_IRQ;
-    st = XIntc_Start(&intc, XIN_REAL_MODE);
-    if (st != XST_SUCCESS) return INIT_ERR_IRQ;
-    XIntc_Enable(&intc, TMR_INTR_ID);
-
+    if (XTmrCtr_Initialize(&timer, TIMER_ID) != XST_SUCCESS) return 0;
+    XTmrCtr_SetOptions(&timer, 0, XTC_INT_MODE_OPTION |
+                      XTC_AUTO_RELOAD_OPTION | XTC_DOWN_COUNT_OPTION);
+    XTmrCtr_SetResetValue(&timer, 0, 9998U);
+    XTmrCtr_SetOptions(&timer, 1, XTC_AUTO_RELOAD_OPTION);
+    XTmrCtr_SetResetValue(&timer, 1, 0U);
+    XTmrCtr_Start(&timer, 1);
+    XTmrCtr_SetHandler(&timer, control_isr, &timer);
+    if (XIntc_Initialize(&intc, INTC_ID) != XST_SUCCESS) return 0;
+    if (XIntc_Connect(&intc, 0U,
+                     (XInterruptHandler)XTmrCtr_InterruptHandler,
+                     &timer) != XST_SUCCESS) return 0;
+    if (XIntc_Start(&intc, XIN_REAL_MODE) != XST_SUCCESS) return 0;
+    XIntc_Enable(&intc, 0U);
     Xil_ExceptionInit();
     Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
-                                 (Xil_ExceptionHandler) XIntc_InterruptHandler,
+                                 (Xil_ExceptionHandler)XIntc_InterruptHandler,
                                  &intc);
     Xil_ExceptionEnable();
-    return INIT_OK;
+    XTmrCtr_Start(&timer, 0);
+    return 1;
 }
 
-static int system_init(void)
+static int comprobar_timer(void)
 {
-    int st;
-    st = pwm_init();        if (st != INIT_OK) return st;
-    leds_init();
-    st = adc_init();        if (st != INIT_OK) return st;
-    st = buttons_init();    if (st != INIT_OK) return st;
-    st = uart_init();       if (st != INIT_OK) return st;
-    pr_design();
-    pr_reset();
-    st = interrupts_init(); if (st != INIT_OK) return st;
-    return INIT_OK;
-}
-
-static int buttons_poll(void)
-{
-    int raw = gpio_base[GPIO_DATA_IDX] & BTN_MASK;
-    int edges = 0;
-
-    if (raw != btn_last) {
-        btn_last = raw;
-        btn_t_change = isr_ticks;
-    } else if ((isr_ticks - btn_t_change) >= debounce_ticks && raw != btn_prev) {
-        edges = raw & ~btn_prev;
-        btn_prev = raw;
+    uint32_t t0 = XTmrCtr_GetValue(&timer, 1);
+    while (interrupciones < 3U) {
+        if ((uint32_t)(XTmrCtr_GetValue(&timer, 1) - t0) > CPU_HZ / 10U)
+            return 0;
     }
-    return edges;
+    return 1;
 }
 
-static void print_timing(void)
+/* Antirrebote 20 ms independiente de la frecuencia PWM. */
+static uint32_t botones(void)
 {
-    int n = stat_n;
-    int avg, jit;
-
-    xil_printf("--- TEMPORIZACION DEL LAZO ---\r\n");
-    if (n < 1) {
-        xil_printf("Sin datos (el control no ha corrido)\r\n");
-        return;
+    static uint32_t anterior = 0U, estable = 0U, cambio = 0U;
+    uint32_t raw = gpio[0] & BTN_MASK;
+    uint32_t ahora = XTmrCtr_GetValue(&timer, 1);
+    if (raw != anterior) {
+        anterior = raw;
+        cambio = ahora;
+    } else if (raw != estable && (uint32_t)(ahora - cambio) >= CPU_HZ / 50U) {
+        uint32_t evento = raw & ~estable;
+        estable = raw;
+        return evento;
     }
-    avg = ts_ticks + dev_sum / n;
-    jit = dev_max - dev_min;
-    xil_printf("Ts nominal   = %d ciclos (%d ns)\r\n", ts_ticks, ts_ticks * NS_PER_CYCLE);
-    xil_printf("Periodos     = %d\r\n", n);
-    xil_printf("Periodo medio= %d ciclos (%d ns)\r\n", avg, avg * NS_PER_CYCLE);
-    xil_printf("Desviacion   = min %d, max %d ciclos\r\n", dev_min, dev_max);
-    xil_printf("Jitter p-p   = %d ciclos (%d ns)\r\n", jit, jit * NS_PER_CYCLE);
-    xil_printf("ISR (peor)   = %d ciclos (%d ns) = %d %% de Ts\r\n",
-               isr_max, isr_max * NS_PER_CYCLE, (isr_max * 100) / ts_ticks);
-    if (isr_max + TIMER_ALIGN_CYCLES >= ts_ticks)
-        xil_printf("ATENCION: la ISR no termina antes del siguiente valle\r\n");
+    return 0U;
 }
 
-static void export_samples(void)
+/* Diagnostico minimo por UART bajo peticion, solamente PWM detenido. */
+static void adc_informar(void)
 {
-    int n, start, k;
-
-    log_frozen = 1;
-    n = log_count;
-    start = (log_head - n) & (LOG_LEN - 1);
-
-    xil_printf("\r\n--- MUESTRAS DE CORRIENTE [mA] ---\r\n");
-    xil_printf("fsw=%d Hz, Ts=%d us, N=%d, Iref_pico=%d mA\r\n",
-               FSW_HZ[fsw_idx], 1000000 / FSW_HZ[fsw_idx], n,
-               (int)(AMPL_A[ampl_idx] * 1000.0f));
-    for (k = 0; k < n; k++)
-        xil_printf("%d,%d\r\n", k, log_mA[(start + k) & (LOG_LEN - 1)]);
-    xil_printf("--- FIN ---\r\n");
-    print_timing();
-
-    log_head = 0;  log_count = 0;               /* nuevo historico */
-    log_frozen = 0;
-}
-
-// MAIN
-int main()
-{
-    int st, ev, next;
-
-    //init_platform();
-
-    st = system_init();
-    if (st != INIT_OK) {
-        fault_trip();
-        xil_printf("ERROR de inicializacion, codigo = %d\r\n", st);
-        while (1) { }
+    uint32_t k, suma = 0U, minimo = 4095U, maximo = 0U, n = 0U;
+    for (k = 0U; k < 8U; ++k) {
+        uint16_t raw;
+        adc_disparar_software();
+        if (!adc_esperar(&raw, CPU_HZ / 100U)) break;
+        suma += raw;
+        if (raw < minimo) minimo = raw;
+        if (raw > maximo) maximo = raw;
+        ++n;
     }
+    uart_texto("ADC n="); uart_u32(n);
+    if (n != 0U) {
+        uart_texto(" media="); uart_u32(suma/n);
+        uart_texto(" min="); uart_u32(minimo);
+        uart_texto(" max="); uart_u32(maximo);
+        uart_texto(" Iestim_mA="); uart_i32(adc_a_mA((uint16_t)(suma/n)));
+    }
+    if (n != 8U) uart_texto(" ERROR CONVERSION");
+    uart_texto("\r\n");
+}
 
-    control_reconfigure(PWM_FSEL_INIT);
-    xil_printf("Inicializacion OK. fsw=%d Hz, muestras/periodo=%d\r\n",
-               FSW_HZ[fsw_idx], sine_len);
-    xil_printf("Kp = %d x1e-6 (esperado 1996684 con R=4.7, L=25.3 mH)\r\n",
-               (int)(pr_kp * 1000000.0f));
-    xil_printf("BTN0=exportar BTN1=iniciar/detener BTN2=amplitud BTN3=fsw\r\n");
+static void exportar(void)
+{
+    uint16_t n = hist_total;
+    uint16_t inicio = (uint16_t)((hist_pos - n) & (HIST_N - 1U));
+    uint16_t k;
+    uart_texto("k,Iref_mA,Iadc_mA\r\n");
+    for (k = 0U; k < n; ++k) {
+        uint16_t pos = (uint16_t)((inicio + k) & (HIST_N - 1U));
+        uart_u32(k); uart_texto(",");
+        uart_i32(hist_ref[pos]); uart_texto(",");
+        uart_i32(hist_i[pos]); uart_texto("\r\n");
+    }
+    uart_texto("Muestras="); uart_u32(n);
+    uart_texto("\r\n");
+    hist_pos = hist_total = 0U;
+}
 
-#if AUTO_START
-    control_start();
-#endif
+int main(void)
+{
+    uint32_t eventos;
+    pwm_apagar();
+    gpio[1] = 0xFFFFFFFFU; /* 5 botones de entrada */
+    gpio[3] = 0U;          /* 16 LEDs de salida */
+    gpio[2] = LED_LISTO;
+
+    if (!iniciar_interrupciones() || !comprobar_timer()) {
+        falla(ERR_TIMER);
+        while (1) { } /* falla enclavada; reiniciar para rearmar */
+    }
 
     while (1) {
-        ev = buttons_poll();
-
-        if (ev & BTN_ENABLE) {
-            if (sys_state == SYS_WORK) control_stop();
-            else                       control_start();
+        eventos = botones();
+        if (eventos & BTN_START) {
+            if (estado == ACTIVO) {
+                control_detener();
+                uart_texto("PR detenido; PWM apagado.\r\n");
+            } else if (estado == PARADO) {
+                control_iniciar();
+                if (estado == ACTIVO)
+                    uart_texto("PR activo.\r\n");
+                else if (estado == FALLA) {
+                    uart_texto("FALLA ARRANQUE codigo=");
+                    uart_u32(causa);
+                    uart_texto("\r\n");
+                }
+            } else {
+                uart_texto("FALLA enclavada codigo=");
+                uart_u32(causa);
+                uart_texto("\r\n");
+            }
         }
-        if (ev & BTN_AMPL) {
-            next = ((ampl_pending >= 0 ? ampl_pending : ampl_idx) + 1) % 3;
-#if AMPL_CHANGE_AT_PEAK
-            if (sys_state == SYS_WORK) ampl_pending = next;
-            else                       ampl_idx = next;
-#else
-            ampl_idx = next;
-#endif
+        if ((eventos & BTN_AMP) && estado != FALLA) {
+            uint32_t op = (pendiente_amp < 3U) ? pendiente_amp : modo_amp;
+            op = (op + 1U) % 3U;
+            if (estado == ACTIVO) pendiente_amp = op;
+            else modo_amp = op;
+            uart_texto("Referencia pico ");
+            uart_u32(amplitud_mA[op]);
+            uart_texto(" mA\r\n");
         }
-        if (ev & BTN_FSW)  control_reconfigure((fsw_idx + 1) % NUM_FSW);
-        if (ev & BTN_EXPORT) export_samples();
+        if ((eventos & BTN_FREQ) && estado == PARADO) {
+            frecuencia_elegir((modo_f + 1U) % 3U);
+            uart_texto("Frecuencia PWM ");
+            uart_u32(fsw[modo_f]);
+            uart_texto(" Hz\r\n");
+        }
+        if (eventos & BTN_EXPORT) {
+            if (estado == ACTIVO) {
+                uart_texto("Detenga el control para exportar.\r\n");
+            } else if (estado == FALLA) {
+                uart_texto("FALLA codigo="); uart_u32(causa);
+                uart_texto("\r\n");
+            } else if (hist_total > 0U) {
+                exportar();
+            } else {
+                adc_informar();
+            }
+        }
     }
-
-    //cleanup_platform();
-    return 0;
 }
